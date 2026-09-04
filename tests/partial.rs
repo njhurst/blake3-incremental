@@ -45,6 +45,64 @@ impl Rng {
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
     }
+
+    /// A length in `0..=max`, biased toward the values where BLAKE3 tree
+    /// logic changes: exact multiples of 64 bytes / 1024 bytes / cell size
+    /// and their near neighbours, the named boundary lengths
+    /// (0, 1, 63, 64, 65, 511, 1023, 1024, 1025, ...), lengths a hair below
+    /// `cur`, powers of two around `cur`, plus uniform noise.
+    fn boundary_len(&mut self, cur: u64, cell_bytes: u64, max: u64) -> u64 {
+        let mut cand: Vec<u64> = Vec::new();
+        let mut push = |x: u64| {
+            if x <= max {
+                cand.push(x);
+            }
+        };
+        for &x in &[
+            0u64, 1, 63, 64, 65, 511, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096,
+        ] {
+            push(x);
+        }
+        // Truncations that shave off a hair (or a block/chunk).
+        for &d in &[1u64, 63, 64, 65, 511, 1023] {
+            if cur > d {
+                push(cur - d);
+            }
+        }
+        // Exact block/chunk/cell multiples near `cur`, and their neighbours.
+        for &m in &[64u64, 1024, cell_bytes] {
+            let down = cur - cur % m;
+            push(down);
+            for &d in &[1u64, 63, 64, 65] {
+                push(down.saturating_sub(d));
+                push(down + d);
+            }
+        }
+        // Exact cell multiples (and chunk-neighbours of them) for small j.
+        for j in 1..=(max / cell_bytes + 2).min(8) {
+            let x = j * cell_bytes;
+            push(x);
+            for &d in &[1u64, 63, 64, 65, 1023, 1024, 1025] {
+                push(x + d);
+                if x > d {
+                    push(x - d);
+                }
+            }
+        }
+        // Powers of two around the current length.
+        if cur > 0 {
+            let p2 = 1u64 << (63 - cur.leading_zeros());
+            for &d in &[0u64, 1, 2, 3] {
+                push(p2 + d);
+                if p2 > d {
+                    push(p2 - d);
+                }
+            }
+        }
+        push(cur);
+        push(self.below(max + 1));
+        cand[self.below(cand.len() as u64) as usize]
+    }
 }
 
 fn random_content(rng: &mut Rng, len: usize) -> Vec<u8> {
@@ -70,7 +128,9 @@ fn expected_cells(file_len: u64, cell_chunks: u64) -> usize {
     file_len.div_ceil(cell_chunks * 1024) as usize
 }
 
-/// The one assertion that matters: incremental == official single pass.
+/// The one assertion that matters: incremental == official single pass, via
+/// both hash paths (full_hash with content, and content-free finalize where
+/// it is defined: >= 2 cells, or empty).
 fn assert_hash_matches(partial: &PartialBlake3, content: &[u8], context: &str) {
     let got = partial.full_hash(content);
     let want = blake3::hash(content);
@@ -82,6 +142,14 @@ fn assert_hash_matches(partial: &PartialBlake3, content: &[u8], context: &str) {
         partial.cell_chunks(),
         partial.cell_count(),
     );
+    match partial.cell_count() {
+        0 | 2.. => assert_eq!(
+            partial.finalize().unwrap(),
+            got,
+            "finalize() disagrees with full_hash ({context})"
+        ),
+        1 => assert!(partial.finalize().is_err()),
+    }
 }
 
 fn assert_consistent_state(partial: &PartialBlake3, content: &[u8], context: &str) {
@@ -768,8 +836,243 @@ fn append_truncate_resize() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. API validation.
+// 10. The fundamental invariant incremental_root(F) == blake3(F), hammered
+//     at byte granularity: every byte length through the 1->2 chunk
+//     transition and the first cell boundary (plus the named boundary
+//     lengths 0,1,63,64,65,1023,1024,1025 and neighbours of exact cell
+//     multiples), for several cell sizes. Final-chunk handling and the
+//     <=1-cell fallback hide their bugs here.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn byte_granular_invariant() {
+    let mut tasks: Vec<(u64, u64)> = Vec::new();
+    for &p in &[1u64, 2, 4, 16] {
+        // Exhaustive byte lengths through the 1->2 chunk transition (and the
+        // first-cell transition for the small cell sizes).
+        let sweep_end = if p <= 4 { 4200 } else { 2600 };
+        for len in 0..=sweep_end {
+            tasks.push((p, len));
+        }
+        // Byte-exact neighbourhood of the first two cell boundaries.
+        for j in 1..=2u64 {
+            let x = j * p * 1024;
+            for d in -65i64..=65 {
+                tasks.push((p, (x as i64 + d).max(0) as u64));
+            }
+        }
+    }
+    for &p in &[1024u64] {
+        // Sub-cell byte lengths exhaustively (content path), plus byte-exact
+        // neighbourhoods of the cell boundaries at ~1 MiB and ~2 MiB.
+        for len in 0..=2300 {
+            tasks.push((p, len));
+        }
+        for j in 1..=2u64 {
+            let x = j * p * 1024;
+            for d in [-65i64, -64, -63, -3, -2, -1, 0, 1, 2, 3, 63, 64, 65] {
+                tasks.push((p, (x as i64 + d).max(0) as u64));
+            }
+        }
+    }
+
+    let base = 0x8A5E_11E7_D00D_CAFE;
+    parallel_for(tasks.len(), |t| {
+        let (p, len) = tasks[t];
+        let mut rng = Rng::new(task_seed(base, t as u64));
+        // Alternate random and uniform content (uniform stresses chunk/CV
+        // coincidences).
+        let content = if rng.next_u64() & 1 == 0 {
+            random_content(&mut rng, len as usize)
+        } else {
+            vec![(rng.next_u64() as u8).max(1); len as usize]
+        };
+        let partial = PartialBlake3::build(&content, p).unwrap();
+        assert_consistent_state(
+            &partial,
+            &content,
+            &format!("task {t}: byte-granular len={len} P={p}"),
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 11. Mixed-operation fuzz: maintain the fundamental invariant over long
+//     random sequences of overwrites (small, block-aligned, cell-
+//     straddling, bulk), appends and truncations (lengths biased toward
+//     block/chunk/cell/pow2 boundaries, occasionally via the content-free
+//     resize_from_cvs path), asserting incremental == official blake3 after
+//     *every* operation and comparing the whole cell state against a fresh
+//     rebuild.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixed_operation_fuzz() {
+    // (cell chunks P, sequences, ops per sequence)
+    let configs: &[(u64, u64, u64)] = &[
+        (1, 8, 40),
+        (2, 6, 36),
+        (4, 6, 32),
+        (16, 5, 28),
+        (1024, 6, 22),
+    ];
+    let tasks: Vec<(u64, u64)> = configs
+        .iter()
+        .flat_map(|&(p, seqs, ops)| (0..seqs).map(move |_| (p, ops)))
+        .collect();
+    let base = 0xF00D_C0DE_5EED_1234;
+    parallel_for(tasks.len(), |t| {
+        let (p, ops) = tasks[t];
+        let mut rng = Rng::new(task_seed(base, t as u64));
+        let cb = p * 1024;
+        let max_len = 8 * cb + 1024 * 1024; // file size ceiling per sequence
+        let start = rng.boundary_len(max_len / 3, cb, max_len);
+        let mut content = random_content(&mut rng, start as usize);
+        let mut partial = PartialBlake3::build(&content, p).unwrap();
+
+        for op in 0..ops {
+            let n = content.len() as u64;
+            // Route around degenerate sizes: no bytes -> only appends make
+            // sense; at the ceiling -> no appends.
+            let kind = if n == 0 {
+                4 + rng.below(2) // append or rebuild
+            } else if n >= max_len {
+                6 + rng.below(4) // truncate, overwrite or rebuild
+            } else {
+                rng.below(10)
+            };
+            let ctx = |what: &str, len: u64| format!("task {t}: P={p} op={op} {what} len={len}");
+
+            match kind {
+                // ---- overwrites (in place, via refresh) ----
+                0..=1 => {
+                    let off = rng.below(n);
+                    let l = (1 + rng.below(64)).min(n - off);
+                    let (off, l) = (off as usize, l as usize);
+                    rng.fill(&mut content[off..off + l]);
+                    partial.refresh(&content, off as u64..(off + l) as u64);
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("small overwrite", content.len() as u64),
+                    );
+                }
+                2 => {
+                    let off = if n >= 64 {
+                        (64 * rng.below(n / 64)) as usize
+                    } else {
+                        0
+                    };
+                    let l = if n >= 64 { 64 } else { n as usize };
+                    rng.fill(&mut content[off..off + l]);
+                    partial.refresh(&content, off as u64..(off + l) as u64);
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("block overwrite", content.len() as u64),
+                    );
+                }
+                3 => {
+                    let off = rng.below(n) as usize;
+                    let l = (1 + rng.below(65536)).min(n - off as u64) as usize;
+                    rng.fill(&mut content[off..off + l]);
+                    partial.refresh(&content, off as u64..(off + l) as u64);
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("large overwrite", content.len() as u64),
+                    );
+                }
+                9 => {
+                    // Straddle a cell boundary (or, failing that, a chunk
+                    // boundary) so that two cells go dirty at once.
+                    let cells = partial.cell_count() as u64;
+                    let off = if cells > 1 {
+                        let m = rng.below(cells);
+                        (m * cb).saturating_sub(32).min(n - 1)
+                    } else {
+                        let m = (n / 1024).max(1) - 1;
+                        (m * 1024).saturating_sub(32).min(n - 1)
+                    };
+                    let l = (64 + rng.below(448)).min(n - off);
+                    let (off, l) = (off as usize, l as usize);
+                    rng.fill(&mut content[off..off + l]);
+                    partial.refresh(&content, off as u64..(off + l) as u64);
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("straddling overwrite", content.len() as u64),
+                    );
+                }
+                // ---- appends (via resize, sometimes resize_from_cvs) ----
+                4..=5 => {
+                    let mut target = rng.boundary_len(n, cb, max_len);
+                    for _ in 0..7 {
+                        if target > n {
+                            break;
+                        }
+                        target = rng.boundary_len(n, cb, max_len);
+                    }
+                    if target <= n {
+                        target = n + 1 + rng.below(max_len - n);
+                    }
+                    let old_len = n;
+                    content.extend_from_slice(&random_content(&mut rng, (target - n) as usize));
+                    if rng.below(4) == 0 {
+                        let dirty = dirty_cvs_from_content(&content, old_len, p);
+                        partial.resize_from_cvs(target, dirty).unwrap_or_else(|e| {
+                            panic!("{}: {e}", ctx("append via cvs", content.len() as u64))
+                        });
+                    } else {
+                        partial.resize(&content);
+                    }
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("append", content.len() as u64),
+                    );
+                }
+                // ---- truncations ----
+                6..=7 => {
+                    let target = rng.boundary_len(n, cb, n - 1);
+                    let old_len = n;
+                    content.truncate(target as usize);
+                    if rng.below(4) == 0 {
+                        let dirty = dirty_cvs_from_content(&content, old_len, p);
+                        partial.resize_from_cvs(target, dirty).unwrap_or_else(|e| {
+                            panic!("{}: {e}", ctx("truncate via cvs", content.len() as u64))
+                        });
+                    } else {
+                        partial.resize(&content);
+                    }
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("truncate", content.len() as u64),
+                    );
+                }
+                // ---- rebuild: state must equal a fresh build exactly ----
+                _ => {
+                    let rebuilt = PartialBlake3::build(&content, p).unwrap();
+                    assert_eq!(partial.cell_count(), rebuilt.cell_count());
+                    for m in 0..partial.cell_count() {
+                        assert_eq!(
+                            partial.cell_cv(m),
+                            rebuilt.cell_cv(m),
+                            "{}: rebuild drift in cell {m}",
+                            ctx("rebuild check", content.len() as u64)
+                        );
+                    }
+                    assert_consistent_state(
+                        &partial,
+                        &content,
+                        &ctx("rebuild check", content.len() as u64),
+                    );
+                }
+            }
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // 6. API validation.

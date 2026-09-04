@@ -146,22 +146,40 @@ locally, but is not part of this repository.)
 
 ## Randomized tester
 
-`cargo test` runs ten deterministic (SplitMix64-seeded) test groups that
+`cargo test` runs twelve deterministic (SplitMix64-seeded) test groups that
 compare `PartialBlake3` output against official single-pass `blake3::hash`,
-with heavy loops partitioned across all cores:
+with heavy loops partitioned across all cores. The core invariant asserted
+everywhere — and after *every* operation in the fuzz groups — is
+
+```text
+incremental_root(F) == blake3(F)
+```
 
 * **exhaustive** lengths 0..=700 for cell sizes 1/2/4 chunks (empty files,
   sub-chunk lengths, the ≤1-cell content fallback);
+* **byte-granular invariant** — for P ∈ {1, 2, 4, 16}: *every* byte length
+  0..=4200 (through the 1→2-chunk and first-cell transitions) and the exact
+  byte neighbourhood of the first two cell boundaries; for P = 1024:
+  exhaustive sub-cell lengths plus byte-exact cell-boundary neighbourhoods
+  around 1 MiB and 2 MiB. This is where 0, 1, 63, 64, 65, 1023, 1024, 1025
+  and the ≤1-cell fallback are hammered;
 * **boundary lengths** — for P ∈ {1, 2, 4, 16, 1024}: dense small lengths,
   chunk counts just below/at/above multiples of P (the N % P == 0
-  transitions), perfect-tree sizes and neighbors, and final chunks of
-  1/63/64/65/1023 bytes;
+  transitions), perfect-tree sizes and neighbors (chunk counts around powers
+  of two), and final chunks of 1/63/64/65/1023 bytes;
 * **random lengths** up to 96 MiB across cell sizes;
 * **edit sequences** — hundreds of randomized in-place edits (arbitrary
   ranges, 64-byte block writes, cell-straddling, final-chunk edits); after
   each `refresh` the hash must match a fresh single pass, cells untouched by
   the edit must be bit-for-bit unchanged, and a from-scratch rebuild must
   reproduce the exact same cell state;
+* **mixed-operation fuzz** — long random sequences per (P, seed): small /
+  block-aligned / cell-straddling / bulk overwrites, appends and truncations
+  whose lengths are biased toward 64-byte, chunk and cell boundaries and
+  powers of two (occasionally routed through the content-free
+  `resize_from_cvs` path); the invariant is asserted after every operation,
+  and the whole cell state is periodically compared against a fresh
+  `rebuild`;
 * **end-of-file length changes** (`append_truncate_resize`) — `resize` must
   re-hash exactly the cells whose byte range changed (cross-checked against a
   first-principles staleness rule) and agree with `rebuild` and single-pass
