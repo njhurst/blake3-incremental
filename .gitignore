@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Local upstream reference clone (not part of this project)
+/BLAKE3
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

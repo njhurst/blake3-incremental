@@ -1,0 +1,28 @@
+[package]
+name = "blake3-incremental"
+version = "0.1.0"
+edition = "2021"
+description = "Incremental BLAKE3: recompute the hash of a large file from partial hashes of a power-of-two cell cover"
+license = "CC0-1.0 OR Apache-2.0"
+
+[dependencies]
+# The official BLAKE3 crate from crates.io, used both as the tree-building
+# library (its `hazmat` module provides chunk/subtree chaining values and
+# parent merges) and as the single-pass oracle in the randomized tests. The
+# `rayon` feature enables multithreaded `update_rayon` for the demo's
+# full-file rehash baseline.
+blake3 = { version = "1.8.7", features = ["rayon"] }
+
+# The upstream BLAKE3 source tree (./BLAKE3, a local git clone used as
+# reference while developing) is not part of this project and is gitignored.
+[workspace]
+members = ["."]
+exclude = ["BLAKE3"]
+
+# Hash-heavy randomized tests: compile the blake3 dependency with optimizations
+# even in dev builds, otherwise the tester runs ~10-20x slower.
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.release]
+lto = true
