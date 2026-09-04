@@ -3,7 +3,7 @@ name = "blake3-incremental"
 version = "0.1.0"
 edition = "2021"
 description = "Incremental BLAKE3: recompute the hash of a large file from partial hashes of a power-of-two cell cover"
-license = "CC0-1.0 OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 # The official BLAKE3 crate from crates.io, used both as the tree-building

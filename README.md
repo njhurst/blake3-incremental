@@ -220,5 +220,5 @@ state keeps working — every recompute touches only the edited cells.
 
 ## License
 
-CC0-1.0 OR Apache-2.0 (this crate's own code; the `blake3` dependency is
-`CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception`).
+MIT (this crate's own code, see `LICENSE`). The `blake3` dependency keeps
+its own license (`CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception`).
