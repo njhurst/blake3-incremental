@@ -246,6 +246,7 @@ impl std::error::Error for ResizeCvError {}
 /// cover a file, which are enough to recompute the file's root hash.
 ///
 /// See the [module documentation](self) for the scheme and an example.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialBlake3 {
     /// Number of 1024-byte chunks per full cell (`P`, a power of two).
     cell_chunks: u64,
@@ -340,6 +341,12 @@ impl PartialBlake3 {
     /// Replace the stored chaining value of cell `m` and return the previous
     /// value — or `None` (changing nothing) if `m` is out of range.
     ///
+    /// Note the deliberate asymmetry with [`Self::from_cell_cvs`], which
+    /// rejects any cover-size mismatch with a typed error: here a bogus cell
+    /// index is a programming error, and the `None` return is the entire
+    /// contract — check it whenever the index does not come from code you
+    /// fully control.
+    ///
     /// This is the aggregator-side counterpart of a block rewrite: after a
     /// storage node rewrites the block a cell covers, it reports the new CV
     /// ([`subtree_cv`]) and the aggregator swaps it in place. The next
@@ -430,19 +437,19 @@ impl PartialBlake3 {
             return;
         }
         let cells = self.file_len.div_ceil(self.cell_bytes);
-        self.cells.resize(cells as usize, [0u8; 32]);
-        let computed = compute_cells(
+        self.cells = compute_cells(
             content,
             self.cell_bytes,
             self.file_len,
             0..=cells - 1,
             threads,
         );
-        self.cells.copy_from_slice(&computed);
     }
 
     /// Grow or shrink the file at the end (`content` must be the file's new
-    /// full content): append or truncate.
+    /// full content): append or truncate. If the length is unchanged this is
+    /// a no-op even if bytes changed — in-place edits of unchanged length
+    /// must go through [`Self::refresh`].
     ///
     /// A cell chaining value depends only on its own bytes and its offset, so
     /// surviving cells are untouched: truncation re-hashes at most the new
@@ -475,10 +482,10 @@ impl PartialBlake3 {
         }
         let cell_bytes = self.cell_bytes;
         let dirty_from = resize_dirty_from(old_len, new_len, cell_bytes);
-        self.resize_inner(new_len, dirty_from, |dirty, cells_dirty| {
+        if let Some((dirty, cells_dirty)) = self.resize_dirty_tail(new_len, dirty_from) {
             let computed = compute_cells(content, cell_bytes, new_len, dirty, threads);
             cells_dirty.copy_from_slice(&computed);
-        });
+        }
     }
 
     /// Aggregator-side resize — same semantics as [`Self::resize`], but the
@@ -518,21 +525,21 @@ impl PartialBlake3 {
                 got: cvs.len(),
             });
         }
-        self.resize_inner(new_len, dirty_from, |_, cells_dirty| {
+        if let Some((_, cells_dirty)) = self.resize_dirty_tail(new_len, dirty_from) {
             cells_dirty.copy_from_slice(&cvs);
-        });
+        }
         Ok(())
     }
 
     /// Shared tail of the resize paths: set the new length, size the cell
-    /// list, and hand the caller the slice of cells that need fresh values
+    /// list, and return the range and slice of cells that need fresh values
     /// (those from `dirty_from` on; cells below are kept as they are).
-    fn resize_inner(
+    /// Returns `None` when no surviving cell needs a fresh value.
+    fn resize_dirty_tail(
         &mut self,
         new_len: u64,
         dirty_from: u64,
-        fill: impl FnOnce(RangeInclusive<u64>, &mut [ChainingValue]),
-    ) {
+    ) -> Option<(RangeInclusive<u64>, &mut [ChainingValue])> {
         let new_cells = if new_len == 0 {
             0
         } else {
@@ -543,7 +550,9 @@ impl PartialBlake3 {
         self.cells.resize(new_cells as usize, [0u8; 32]);
         if dirty_from < new_cells {
             let (_, dirty) = self.cells.split_at_mut(dirty_from as usize);
-            fill(dirty_from..=new_cells - 1, dirty);
+            Some((dirty_from..=new_cells - 1, dirty))
+        } else {
+            None
         }
     }
 
@@ -579,6 +588,10 @@ impl PartialBlake3 {
             content.len(),
             self.file_len,
         );
+        assert!(
+            changed.start <= changed.end,
+            "changed range {changed:?} is reversed",
+        );
         let cell_count = self.cells.len() as u64;
         if cell_count == 0 || changed.is_empty() {
             return;
@@ -605,13 +618,20 @@ impl PartialBlake3 {
     /// Compute the full 32-byte BLAKE3 hash of the file from the stored
     /// partial chaining values.
     ///
-    /// `content` must be the current file content: when the file spans more
+    /// `content` must be the *current* file content: when the file spans more
     /// than one cell only its length is checked and the bytes are not read,
     /// but files that fit in a single cell have no partial pieces to reuse
     /// and are hashed with a normal single pass. If you do not have the
     /// content at all (e.g. an aggregator in a distributed system), use
     /// [`Self::finalize`] instead, which works without content for every file
     /// larger than one cell.
+    ///
+    /// Warning: for a file spanning more than one cell, passing *stale*
+    /// content of the same length (e.g. forgetting [`Self::refresh`] after an
+    /// edit) is not detected — the result is the hash of the stored cell
+    /// state, not of the bytes in your hand. If you cannot vouch that
+    /// `content` is current, use [`Self::finalize`] and hash small files
+    /// separately.
     pub fn full_hash(&self, content: &[u8]) -> Hash {
         assert_eq!(
             content.len() as u64,
@@ -677,8 +697,17 @@ impl PartialBlake3 {
 /// the piece must be a valid subtree of the file's tree: it must be an
 /// aligned power-of-two-sized range, or the file's final (possibly short)
 /// range. A cover of equal power-of-two cells satisfies this automatically
-/// (see [`PartialBlake3`]). These rules are enforced by the underlying
-/// `blake3::hazmat` code, which panics on violations.
+/// (see [`PartialBlake3`]).
+///
+/// # Panics
+///
+/// The underlying `blake3::hazmat` code panics when these rules are
+/// violated: on a `byte_offset` that is not a multiple of 1024, on an empty
+/// piece, and on a piece longer than the maximum valid subtree at its
+/// offset. Only the first two of these are checkable without knowing the
+/// file length, so this function stays infallible rather than offering
+/// partial validation — callers must supply piece boundaries that obey the
+/// rules above (the cell cover of a [`PartialBlake3`] always does).
 ///
 /// The result depends only on the piece's bytes and its offset, never on the
 /// total file length or on neighboring pieces, so nodes can compute it
@@ -699,7 +728,7 @@ pub fn subtree_cv(bytes: &[u8], byte_offset: u64) -> ChainingValue {
 /// offset, so its chunks carry their global counters.
 fn compute_cell_cv(content: &[u8], m: u64, cell_bytes: u64, file_len: u64) -> ChainingValue {
     let start = m * cell_bytes;
-    let end = ((m + 1) * cell_bytes).min(file_len);
+    let end = (m + 1).saturating_mul(cell_bytes).min(file_len);
     subtree_cv(&content[start as usize..end as usize], start)
 }
 
@@ -734,35 +763,24 @@ fn compute_cells(
         }
         return cvs;
     }
-    // Each worker computes an owned share and returns it; the shares are
-    // spliced back in order after all workers join.
-    let shares: Vec<Vec<ChainingValue>> = std::thread::scope(|s| {
+    // Each worker hashes a contiguous, disjoint share of the output slice in
+    // place; shares differ in size by at most one cell (per-cell work is
+    // uniform), and the scoped threads join before `cvs` is used again.
+    let share_size = count.div_ceil(workers);
+    std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(workers);
-        for w in 0..workers {
-            let share_first = first + (w * count / workers) as u64;
-            let share_last = first
-                + if w + 1 == workers {
-                    count
-                } else {
-                    (w + 1) * count / workers
-                } as u64
-                - 1;
+        for (w, share) in cvs.chunks_mut(share_size).enumerate() {
+            let share_first = first + (w * share_size) as u64;
             handles.push(s.spawn(move || {
-                (share_first..=share_last)
-                    .map(|m| compute_cell_cv(content, m, cell_bytes, file_len))
-                    .collect()
+                for (i, cv) in share.iter_mut().enumerate() {
+                    *cv = compute_cell_cv(content, share_first + i as u64, cell_bytes, file_len);
+                }
             }));
         }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("cell hashing worker panicked"))
-            .collect()
+        for h in handles {
+            h.join().expect("cell hashing worker panicked");
+        }
     });
-    let mut i = 0;
-    for share in shares {
-        cvs[i..i + share.len()].copy_from_slice(&share);
-        i += share.len();
-    }
     cvs
 }
 
@@ -784,7 +802,7 @@ fn resize_dirty_from(old_len: u64, new_len: u64, cell_bytes: u64) -> u64 {
         // Truncation: everything below the cut is untouched. Only the new
         // final cell can change, and only when it is short (a cell-aligned
         // truncation keeps a full final cell whose CV is still valid).
-        if new_len % cell_bytes == 0 {
+        if new_len.is_multiple_of(cell_bytes) {
             new_cells
         } else {
             new_cells - 1
@@ -797,7 +815,7 @@ fn resize_dirty_from(old_len: u64, new_len: u64, cell_bytes: u64) -> u64 {
         } else {
             old_len.div_ceil(cell_bytes)
         };
-        if old_len % cell_bytes == 0 {
+        if old_len.is_multiple_of(cell_bytes) {
             old_cells
         } else {
             old_cells - 1

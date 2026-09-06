@@ -20,15 +20,18 @@ use blake3_incremental::PartialBlake3;
 
 // ---------------------------------------------------------------------------
 
+/// Scan the arguments once for `--name <value>`; fall back to `default` when
+/// the flag is absent or the value does not parse.
 fn parse_arg<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::args()
-        .nth(
-            1 + std::env::args()
-                .position(|a| a == name)
-                .unwrap_or(usize::MAX),
-        )
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    let mut args = std::env::args();
+    let mut value = None;
+    while let Some(arg) = args.next() {
+        if arg == name {
+            value = args.next();
+            break;
+        }
+    }
+    value.and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// SplitMix64-based content fill, parallelized across cores.
@@ -68,6 +71,14 @@ fn main() {
     let trials: usize = parse_arg("--trials", 64);
 
     let file_len = size_mib * 1024 * 1024;
+    assert!(
+        file_len > 64,
+        "--size is too small to hold one 64-byte block edit"
+    );
+    assert!(
+        trials >= 2,
+        "--trials must be at least 2 (the first trial is dropped as warmup)"
+    );
     let cells = (file_len as u64).div_ceil(cell_chunks * 1024);
     println!("file        : {size_mib} MiB = {file_len} bytes");
     println!(

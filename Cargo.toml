@@ -10,8 +10,10 @@ license = "MIT"
 # library (its `hazmat` module provides chunk/subtree chaining values and
 # parent merges) and as the single-pass oracle in the randomized tests. The
 # `rayon` feature enables multithreaded `update_rayon` for the demo's
-# full-file rehash baseline.
-blake3 = { version = "1.8.7", features = ["rayon"] }
+# full-file rehash baseline. Pinned exactly: upstream documents `hazmat` as
+# unstable, so a semver-compatible bump could re-shape the API this crate is
+# built on.
+blake3 = { version = "=1.8.7", features = ["rayon"] }
 
 # The upstream BLAKE3 source tree (./BLAKE3, a local git clone used as
 # reference while developing) is not part of this project and is gitignored.
